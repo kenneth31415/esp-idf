@@ -104,7 +104,9 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 .extern pxCurrentTCB
 
 /* Enable stack backtrace across exception/interrupt - see below */
-#define XT_DEBUG_BACKTRACE    0
+#ifdef CONFIG_FREERTOS_INTERRUPT_BACKTRACE
+#define XT_DEBUG_BACKTRACE    1
+#endif
 
 
 /*
@@ -173,13 +175,19 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
   NOTE: For CALL0 ABI, a12-a15 have not yet been saved.
 
-  NOTE: This macro will use registers a0 and a2-a6. The arguments are:
+  NOTE: This macro will use registers a0 and a2-a7. The arguments are:
     level -- interrupt level
     mask  -- interrupt bitmask for this level
 --------------------------------------------------------------------------------
 */
 
     .macro  dispatch_c_isr    level  mask
+
+    #ifdef CONFIG_PM_TRACE
+    movi a6, 0 /* = ESP_PM_TRACE_IDLE */
+    getcoreid a7
+    call4 esp_pm_trace_exit
+    #endif // CONFIG_PM_TRACE
 
     /* Get mask of pending, enabled interrupts at this level into a2. */
 
@@ -195,13 +203,17 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
        It does take a few more instructions, so undef XT_DEBUG_BACKTRACE
        if you want to save the cycles.
     */
-    #if XT_DEBUG_BACKTRACE
+    #ifdef XT_DEBUG_BACKTRACE
     #ifndef __XTENSA_CALL0_ABI__
     rsr     a0, EPC_1 + \level - 1          /* return address */
     movi    a4, 0xC0000000                  /* constant with top 2 bits set (call size) */
     or      a0, a0, a4                      /* set top 2 bits */
     addx2   a0, a4, a0                      /* clear top bit -- simulating call4 size   */
     #endif
+    #endif
+
+    #ifdef CONFIG_PM_ENABLE
+    call4 esp_pm_impl_isr_hook
     #endif
 
     #ifdef XT_INTEXC_HOOKS

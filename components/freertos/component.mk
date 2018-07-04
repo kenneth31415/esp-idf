@@ -6,6 +6,4 @@ COMPONENT_ADD_LDFLAGS += -Wl,--undefined=uxTopUsedPriority
 COMPONENT_ADD_INCLUDEDIRS := include
 COMPONENT_PRIV_INCLUDEDIRS := include/freertos
 
-#ifdef CONFIG_SYSVIEW_ENABLE
-#COMPONENT_ADD_INCLUDEDIRS += app_trace
-#endif
+tasks.o event_groups.o timers.o queue.o ringbuf.o: CFLAGS += -D_ESP_FREERTOS_INTERNAL

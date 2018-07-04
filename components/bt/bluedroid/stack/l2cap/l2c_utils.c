@@ -25,18 +25,18 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "allocator.h"
-#include "controller.h"
-#include "bt_types.h"
-#include "hcimsgs.h"
-#include "l2cdefs.h"
+#include "osi/allocator.h"
+#include "device/controller.h"
+#include "stack/bt_types.h"
+#include "stack/hcimsgs.h"
+#include "stack/l2cdefs.h"
 #include "l2c_int.h"
-#include "hcidefs.h"
-#include "btu.h"
-#include "btm_api.h"
+#include "stack/hcidefs.h"
+#include "stack/btu.h"
+#include "stack/btm_api.h"
 #include "btm_int.h"
-#include "hcidefs.h"
-#include "allocator.h"
+#include "stack/hcidefs.h"
+#include "osi/allocator.h"
 
 /*******************************************************************************
 **
@@ -54,8 +54,11 @@ tL2C_LCB *l2cu_allocate_lcb (BD_ADDR p_bd_addr, BOOLEAN is_bonding, tBT_TRANSPOR
 
     for (xx = 0; xx < MAX_L2CAP_LINKS; xx++, p_lcb++) {
         if (!p_lcb->in_use) {
-            memset (p_lcb, 0, sizeof (tL2C_LCB));
+            btu_free_timer(&p_lcb->timer_entry);
+            btu_free_timer(&p_lcb->info_timer_entry);
+            btu_free_timer(&p_lcb->upda_con_timer);
 
+            memset (p_lcb, 0, sizeof (tL2C_LCB));
             memcpy (p_lcb->remote_bd_addr, p_bd_addr, BD_ADDR_LEN);
 
             p_lcb->in_use          = TRUE;
@@ -71,6 +74,7 @@ tL2C_LCB *l2cu_allocate_lcb (BD_ADDR p_bd_addr, BOOLEAN is_bonding, tBT_TRANSPOR
 #if (BLE_INCLUDED == TRUE)
             p_lcb->transport       = transport;
             p_lcb->tx_data_len     = controller_get_interface()->get_ble_default_data_packet_length();
+            p_lcb->le_sec_pending_q = fixed_queue_new(SIZE_MAX);
 
             if (transport == BT_TRANSPORT_LE) {
                 l2cb.num_ble_links_active++;
@@ -82,6 +86,9 @@ tL2C_LCB *l2cu_allocate_lcb (BD_ADDR p_bd_addr, BOOLEAN is_bonding, tBT_TRANSPOR
                 l2c_link_adjust_allocation();
             }
             p_lcb->link_xmit_data_q = list_new(NULL);
+#if (C2H_FLOW_CONTROL_INCLUDED == TRUE)
+            p_lcb->completed_packets = 0;
+#endif ///C2H_FLOW_CONTROL_INCLUDED == TRUE
             return (p_lcb);
         }
     }
@@ -126,9 +133,13 @@ void l2cu_release_lcb (tL2C_LCB *p_lcb)
     p_lcb->in_use     = FALSE;
     p_lcb->is_bonding = FALSE;
 
-    /* Stop timers */
-    btu_stop_timer (&p_lcb->timer_entry);
-    btu_stop_timer (&p_lcb->info_timer_entry);
+    /* Stop and release timers */
+    btu_free_timer (&p_lcb->timer_entry);
+    memset(&p_lcb->timer_entry, 0, sizeof(TIMER_LIST_ENT));
+    btu_free_timer (&p_lcb->info_timer_entry);
+    memset(&p_lcb->info_timer_entry, 0, sizeof(TIMER_LIST_ENT));
+    btu_free_timer(&p_lcb->upda_con_timer);
+    memset(&p_lcb->upda_con_timer, 0, sizeof(TIMER_LIST_ENT));
 
     /* Release any unfinished L2CAP packet on this link */
     if (p_lcb->p_hcit_rcv_acl) {
@@ -228,6 +239,25 @@ void l2cu_release_lcb (tL2C_LCB *p_lcb)
 
         (*p_cb) (L2CAP_PING_RESULT_NO_LINK);
     }
+
+	/* Check and release all the LE COC connections waiting for security */
+    if (p_lcb->le_sec_pending_q)
+    {
+        while (!fixed_queue_is_empty(p_lcb->le_sec_pending_q))
+        {
+            tL2CAP_SEC_DATA *p_buf = (tL2CAP_SEC_DATA*) fixed_queue_dequeue(p_lcb->le_sec_pending_q);
+            if (p_buf->p_callback)
+                p_buf->p_callback(p_lcb->remote_bd_addr, p_lcb->transport, p_buf->p_ref_data, BTM_DEV_RESET);
+            osi_free(p_buf);
+        }
+        fixed_queue_free(p_lcb->le_sec_pending_q, NULL);
+        p_lcb->le_sec_pending_q = NULL;
+    }
+
+#if (C2H_FLOW_CONTROL_INCLUDED == TRUE)
+    p_lcb->completed_packets = 0;
+#endif ///C2H_FLOW_CONTROL_INCLUDED == TRUE
+
 }
 
 
@@ -928,7 +958,7 @@ void l2cu_send_peer_disc_rsp (tL2C_LCB *p_lcb, UINT8 remote_id, UINT16 local_cid
         L2CAP_TRACE_WARNING("lcb already released\n");
         return;
     }
-    
+
     if ((p_buf = l2cu_build_header(p_lcb, L2CAP_DISC_RSP_LEN, L2CAP_CMD_DISC_RSP, remote_id)) == NULL) {
         L2CAP_TRACE_WARNING ("L2CAP - no buffer for disc_rsp");
         return;
@@ -1461,25 +1491,24 @@ tL2C_CCB *l2cu_allocate_ccb (tL2C_LCB *p_lcb, UINT16 cid)
     memset (&p_ccb->ertm_info, 0, sizeof(tL2CAP_ERTM_INFO));
     p_ccb->peer_cfg_already_rejected = FALSE;
     p_ccb->fcr_cfg_tries         = L2CAP_MAX_FCR_CFG_TRIES;
+
+    /* stop and release timers */
+    btu_free_quick_timer(&p_ccb->fcrb.ack_timer);
+    memset(&p_ccb->fcrb.ack_timer, 0, sizeof(TIMER_LIST_ENT));
     p_ccb->fcrb.ack_timer.param  = (TIMER_PARAM_TYPE)p_ccb;
 
-    /* if timer is running, remove it from timer list */
-    if (p_ccb->fcrb.ack_timer.in_use) {
-        btu_stop_quick_timer (&p_ccb->fcrb.ack_timer);
-    }
-
+    btu_free_quick_timer(&p_ccb->fcrb.mon_retrans_timer);
+    memset(&p_ccb->fcrb.mon_retrans_timer, 0, sizeof(TIMER_LIST_ENT));
     p_ccb->fcrb.mon_retrans_timer.param  = (TIMER_PARAM_TYPE)p_ccb;
 
 // btla-specific ++
     /*  CSP408639 Fix: When L2CAP send amp move channel request or receive
       * L2CEVT_AMP_MOVE_REQ do following sequence. Send channel move
       * request -> Stop retrans/monitor timer -> Change channel state to CST_AMP_MOVING. */
-    if (p_ccb->fcrb.mon_retrans_timer.in_use) {
-        btu_stop_quick_timer (&p_ccb->fcrb.mon_retrans_timer);
-    }
 // btla-specific --
+
 #if (CLASSIC_BT_INCLUDED == TRUE)
-    l2c_fcr_stop_timer (p_ccb);
+    l2c_fcr_free_timer (p_ccb);
 #endif  ///CLASSIC_BT_INCLUDED == TRUE
     p_ccb->ertm_info.preferred_mode  = L2CAP_FCR_BASIC_MODE;        /* Default mode for channel is basic mode */
     p_ccb->ertm_info.allowed_modes   = L2CAP_FCR_CHAN_OPT_BASIC;    /* Default mode for channel is basic mode */
@@ -1491,9 +1520,11 @@ tL2C_CCB *l2cu_allocate_ccb (tL2C_LCB *p_lcb, UINT16 cid)
     p_ccb->tx_mps                    = L2CAP_FCR_TX_BUF_SIZE - 32;
 
     p_ccb->xmit_hold_q  = fixed_queue_new(SIZE_MAX);
+#if (CLASSIC_BT_INCLUDED == TRUE)
     p_ccb->fcrb.srej_rcv_hold_q = fixed_queue_new(SIZE_MAX);
     p_ccb->fcrb.retrans_q = fixed_queue_new(SIZE_MAX);
     p_ccb->fcrb.waiting_for_ack_q = fixed_queue_new(SIZE_MAX);
+#endif  ///CLASSIC_BT_INCLUDED == TRUE
 
     p_ccb->cong_sent    = FALSE;
     p_ccb->buff_quota   = 2;                /* This gets set after config */
@@ -1514,6 +1545,8 @@ tL2C_CCB *l2cu_allocate_ccb (tL2C_LCB *p_lcb, UINT16 cid)
     p_ccb->is_flushable = FALSE;
 #endif
 
+    btu_free_timer(&p_ccb->timer_entry);
+    memset(&p_ccb->timer_entry, 0, sizeof(TIMER_LIST_ENT));
     p_ccb->timer_entry.param = (TIMER_PARAM_TYPE)p_ccb;
     p_ccb->timer_entry.in_use = 0;
 
@@ -1611,12 +1644,20 @@ void l2cu_release_ccb (tL2C_CCB *p_ccb)
         btm_sec_clr_temp_auth_service (p_lcb->remote_bd_addr);
     }
 
-    /* Stop the timer */
-    btu_stop_timer (&p_ccb->timer_entry);
-
+    /* Stop and free the timer */
+    btu_free_timer (&p_ccb->timer_entry);
 
     fixed_queue_free(p_ccb->xmit_hold_q, osi_free_func);
     p_ccb->xmit_hold_q = NULL;
+#if (CLASSIC_BT_INCLUDED == TRUE)
+    fixed_queue_free(p_ccb->fcrb.srej_rcv_hold_q, osi_free_func);
+    fixed_queue_free(p_ccb->fcrb.retrans_q, osi_free_func);
+    fixed_queue_free(p_ccb->fcrb.waiting_for_ack_q, osi_free_func);
+    p_ccb->fcrb.srej_rcv_hold_q = NULL;
+    p_ccb->fcrb.retrans_q = NULL;
+    p_ccb->fcrb.waiting_for_ack_q = NULL;
+#endif  ///CLASSIC_BT_INCLUDED == TRUE
+
 
 #if (CLASSIC_BT_INCLUDED == TRUE)
     l2c_fcr_cleanup (p_ccb);
@@ -1720,6 +1761,37 @@ tL2C_RCB *l2cu_allocate_rcb (UINT16 psm)
     return (NULL);
 }
 
+/*******************************************************************************
+**
+** Function         l2cu_allocate_ble_rcb
+**
+** Description      Look through the BLE Registration Control Blocks for a free
+**                  one.
+**
+** Returns          Pointer to the BLE RCB or NULL if not found
+**
+*******************************************************************************/
+tL2C_RCB *l2cu_allocate_ble_rcb (UINT16 psm)
+{
+    tL2C_RCB    *p_rcb = &l2cb.ble_rcb_pool[0];
+    UINT16      xx;
+
+    for (xx = 0; xx < BLE_MAX_L2CAP_CLIENTS; xx++, p_rcb++)
+    {
+        if (!p_rcb->in_use)
+        {
+            p_rcb->in_use = TRUE;
+            p_rcb->psm    = psm;
+#if (L2CAP_UCD_INCLUDED == TRUE)
+            p_rcb->ucd.state = L2C_UCD_STATE_UNUSED;
+#endif
+            return (p_rcb);
+        }
+    }
+
+    /* If here, no free RCB found */
+    return (NULL);
+}
 
 /*******************************************************************************
 **
@@ -1790,6 +1862,32 @@ tL2C_RCB *l2cu_find_rcb_by_psm (UINT16 psm)
     /* If here, no match found */
     return (NULL);
 }
+
+/*******************************************************************************
+**
+** Function         l2cu_find_ble_rcb_by_psm
+**
+** Description      Look through the BLE Registration Control Blocks to see if
+**                  anyone registered to handle the PSM in question
+**
+** Returns          Pointer to the BLE RCB or NULL if not found
+**
+*******************************************************************************/
+tL2C_RCB *l2cu_find_ble_rcb_by_psm (UINT16 psm)
+{
+    tL2C_RCB    *p_rcb = &l2cb.ble_rcb_pool[0];
+    UINT16      xx;
+
+    for (xx = 0; xx < BLE_MAX_L2CAP_CLIENTS; xx++, p_rcb++)
+    {
+        if ((p_rcb->in_use) && (p_rcb->psm == psm))
+            return (p_rcb);
+    }
+
+    /* If here, no match found */
+    return (NULL);
+}
+
 
 
 /*******************************************************************************
@@ -2112,9 +2210,7 @@ BOOLEAN l2cu_create_conn (tL2C_LCB *p_lcb, tBT_TRANSPORT transport)
 
 #if (BLE_INCLUDED == TRUE)
     tBT_DEVICE_TYPE     dev_type;
-    tBLE_ADDR_TYPE      addr_type;
-
-
+    tBLE_ADDR_TYPE      addr_type = p_lcb->open_addr_type;
     BTM_ReadDevInfo(p_lcb->remote_bd_addr, &dev_type, &addr_type);
 
     if (transport == BT_TRANSPORT_LE) {
@@ -2457,10 +2553,10 @@ void l2cu_resubmit_pending_sec_req (BD_ADDR p_bda)
                     l2c_csm_execute (p_ccb, L2CEVT_SEC_RE_SEND_CMD, NULL);
                 }
             }
-        }       
+        }
     }
 }
-#endif  ///CLASSIC_BT_INCLUDED == TRUE 
+#endif  ///CLASSIC_BT_INCLUDED == TRUE
 
 #if L2CAP_CONFORMANCE_TESTING == TRUE
 /*******************************************************************************
@@ -2497,7 +2593,7 @@ void l2cu_adjust_out_mps (tL2C_CCB *p_ccb)
 
     if (packet_size <= (L2CAP_PKT_OVERHEAD + L2CAP_FCR_OVERHEAD + L2CAP_SDU_LEN_OVERHEAD + L2CAP_FCS_LEN)) {
         /* something is very wrong */
-        L2CAP_TRACE_ERROR ("l2cu_adjust_out_mps bad packet size: %u  will use MPS: %u", packet_size, p_ccb->peer_cfg.fcr.mps);
+        L2CAP_TRACE_DEBUG ("l2cu_adjust_out_mps bad packet size: %u  will use MPS: %u", packet_size, p_ccb->peer_cfg.fcr.mps);
         p_ccb->tx_mps = p_ccb->peer_cfg.fcr.mps;
     } else {
         packet_size -= (L2CAP_PKT_OVERHEAD + L2CAP_FCR_OVERHEAD + L2CAP_SDU_LEN_OVERHEAD + L2CAP_FCS_LEN);
@@ -2841,8 +2937,246 @@ void l2cu_send_peer_ble_par_rsp (tL2C_LCB *p_lcb, UINT16 reason, UINT8 rem_id)
     l2c_link_check_send_pkts (p_lcb, NULL, p_buf);
 }
 
+/*******************************************************************************
+**
+** Function         l2cu_send_peer_ble_credit_based_conn_req
+**
+** Description      Build and send a BLE packet to establish LE connection oriented
+**                  L2CAP channel.
+**
+** Returns          void
+**
+*******************************************************************************/
+void l2cu_send_peer_ble_credit_based_conn_req (tL2C_CCB *p_ccb)
+{
+    BT_HDR  *p_buf;
+    UINT8   *p;
+    tL2C_LCB *p_lcb = NULL;
+    UINT16 mtu;
+    UINT16 mps;
+    UINT16 initial_credit;
+
+    if (!p_ccb)
+        return;
+    p_lcb = p_ccb->p_lcb;
+
+    /* Create an identifier for this packet */
+    p_ccb->p_lcb->id++;
+    l2cu_adj_id(p_ccb->p_lcb, L2CAP_ADJ_ID);
+
+    p_ccb->local_id = p_ccb->p_lcb->id;
+
+    if ((p_buf = l2cu_build_header (p_lcb, L2CAP_CMD_BLE_CREDIT_BASED_CONN_REQ_LEN,
+                    L2CAP_CMD_BLE_CREDIT_BASED_CONN_REQ, p_lcb->id)) == NULL )
+    {
+        L2CAP_TRACE_WARNING ("l2cu_send_peer_ble_credit_based_conn_req - no buffer");
+        return;
+    }
+
+    p = (UINT8 *)(p_buf + 1) + L2CAP_SEND_CMD_OFFSET + HCI_DATA_PREAMBLE_SIZE +
+                               L2CAP_PKT_OVERHEAD + L2CAP_CMD_OVERHEAD;
+
+    mtu = p_ccb->local_conn_cfg.mtu;
+    mps = p_ccb->local_conn_cfg.mps;
+    initial_credit = p_ccb->local_conn_cfg.credits;
+
+    L2CAP_TRACE_DEBUG ("l2cu_send_peer_ble_credit_based_conn_req PSM:0x%04x local_cid:%d\
+                mtu:%d mps:%d initial_credit:%d", p_ccb->p_rcb->real_psm,\
+                p_ccb->local_cid, mtu, mps, initial_credit);
+
+    UINT16_TO_STREAM (p, p_ccb->p_rcb->real_psm);
+    UINT16_TO_STREAM (p, p_ccb->local_cid);
+    UINT16_TO_STREAM (p, mtu);
+    UINT16_TO_STREAM (p, mps);
+    UINT16_TO_STREAM (p, initial_credit);
+
+    l2c_link_check_send_pkts (p_lcb, NULL, p_buf);
+}
+
+/*******************************************************************************
+**
+** Function         l2cu_reject_ble_connection
+**
+** Description      Build and send an L2CAP "Credit based connection res" message
+**                  to the peer. This function is called for non-success cases.
+**
+** Returns          void
+**
+*******************************************************************************/
+void l2cu_reject_ble_connection (tL2C_LCB *p_lcb, UINT8 rem_id, UINT16 result)
+{
+    BT_HDR  *p_buf;
+    UINT8   *p;
+
+    if ((p_buf = l2cu_build_header(p_lcb, L2CAP_CMD_BLE_CREDIT_BASED_CONN_RES_LEN,
+                    L2CAP_CMD_BLE_CREDIT_BASED_CONN_RES, rem_id)) == NULL )
+    {
+        L2CAP_TRACE_WARNING ("l2cu_reject_ble_connection - no buffer");
+        return;
+    }
+
+    p = (UINT8 *)(p_buf + 1) + L2CAP_SEND_CMD_OFFSET + HCI_DATA_PREAMBLE_SIZE +
+                               L2CAP_PKT_OVERHEAD + L2CAP_CMD_OVERHEAD;
+
+    UINT16_TO_STREAM (p, 0);                    /* Local CID of 0   */
+    UINT16_TO_STREAM (p, 0);                    /* MTU */
+    UINT16_TO_STREAM (p, 0);                    /* MPS */
+    UINT16_TO_STREAM (p, 0);                    /* initial credit */
+    UINT16_TO_STREAM (p, result);
+
+    l2c_link_check_send_pkts (p_lcb, NULL, p_buf);
+}
+
+/*******************************************************************************
+**
+** Function         l2cu_send_peer_ble_credit_based_conn_res
+**
+** Description      Build and send an L2CAP "Credit based connection res" message
+**                  to the peer. This function is called in case of success.
+**
+** Returns          void
+**
+*******************************************************************************/
+void l2cu_send_peer_ble_credit_based_conn_res (tL2C_CCB *p_ccb, UINT16 result)
+{
+    BT_HDR  *p_buf;
+    UINT8   *p;
+
+    L2CAP_TRACE_DEBUG ("l2cu_send_peer_ble_credit_based_conn_res");
+    if ((p_buf = l2cu_build_header(p_ccb->p_lcb, L2CAP_CMD_BLE_CREDIT_BASED_CONN_RES_LEN,
+                    L2CAP_CMD_BLE_CREDIT_BASED_CONN_RES, p_ccb->remote_id)) == NULL )
+    {
+        L2CAP_TRACE_WARNING ("l2cu_send_peer_ble_credit_based_conn_res - no buffer");
+        return;
+    }
+
+    p = (UINT8 *)(p_buf + 1) + L2CAP_SEND_CMD_OFFSET + HCI_DATA_PREAMBLE_SIZE +
+                               L2CAP_PKT_OVERHEAD + L2CAP_CMD_OVERHEAD;
+
+    UINT16_TO_STREAM (p, p_ccb->local_cid);                      /* Local CID */
+    UINT16_TO_STREAM (p, p_ccb->local_conn_cfg.mtu);             /* MTU */
+    UINT16_TO_STREAM (p, p_ccb->local_conn_cfg.mps);             /* MPS */
+    UINT16_TO_STREAM (p, p_ccb->local_conn_cfg.credits);         /* initial credit */
+    UINT16_TO_STREAM (p, result);
+
+    l2c_link_check_send_pkts (p_ccb->p_lcb, NULL, p_buf);
+}
+
+/*******************************************************************************
+**
+** Function         l2cu_send_peer_ble_flow_control_credit
+**
+** Description      Build and send a BLE packet to give credits to peer device
+**                  for LE connection oriented L2CAP channel.
+**
+** Returns          void
+**
+*******************************************************************************/
+void l2cu_send_peer_ble_flow_control_credit(tL2C_CCB *p_ccb, UINT16 credit_value)
+{
+    BT_HDR  *p_buf;
+    UINT8   *p;
+    tL2C_LCB *p_lcb = NULL;
+
+    if (!p_ccb)
+        return;
+    p_lcb = p_ccb->p_lcb;
+
+    /* Create an identifier for this packet */
+    p_ccb->p_lcb->id++;
+    l2cu_adj_id(p_ccb->p_lcb, L2CAP_ADJ_ID);
+
+    p_ccb->local_id = p_ccb->p_lcb->id;
+
+    if ((p_buf = l2cu_build_header (p_lcb, L2CAP_CMD_BLE_FLOW_CTRL_CREDIT_LEN,
+                    L2CAP_CMD_BLE_FLOW_CTRL_CREDIT, p_lcb->id)) == NULL )
+    {
+        L2CAP_TRACE_WARNING ("l2cu_send_peer_ble_credit_based_conn_req - no buffer");
+        return;
+    }
+
+    p = (UINT8 *)(p_buf + 1) + L2CAP_SEND_CMD_OFFSET + HCI_DATA_PREAMBLE_SIZE +
+                               L2CAP_PKT_OVERHEAD + L2CAP_CMD_OVERHEAD;
+
+    UINT16_TO_STREAM (p, p_ccb->local_cid);
+    UINT16_TO_STREAM (p, credit_value);
+
+    l2c_link_check_send_pkts (p_lcb, NULL, p_buf);
+}
+
+/*******************************************************************************
+**
+** Function         l2cu_send_peer_ble_credit_based_conn_req
+**
+** Description      Build and send a BLE packet to disconnect LE connection oriented
+**                  L2CAP channel.
+**
+** Returns          void
+**
+*******************************************************************************/
+void l2cu_send_peer_ble_credit_based_disconn_req(tL2C_CCB *p_ccb)
+{
+    BT_HDR  *p_buf;
+    UINT8   *p;
+    tL2C_LCB *p_lcb = NULL;
+    L2CAP_TRACE_DEBUG ("%s",__func__);
+
+    if (!p_ccb)
+        return;
+    p_lcb = p_ccb->p_lcb;
+
+    /* Create an identifier for this packet */
+    p_ccb->p_lcb->id++;
+    l2cu_adj_id(p_ccb->p_lcb, L2CAP_ADJ_ID);
+
+    p_ccb->local_id = p_ccb->p_lcb->id;
+     if ((p_buf = l2cu_build_header (p_lcb, L2CAP_DISC_REQ_LEN,
+                    L2CAP_CMD_DISC_REQ, p_lcb->id)) == NULL )
+    {
+        L2CAP_TRACE_WARNING ("l2cu_send_peer_ble_credit_based_disconn_req - no buffer");
+        return;
+    }
+
+    p = (UINT8 *)(p_buf + 1) + L2CAP_SEND_CMD_OFFSET + HCI_DATA_PREAMBLE_SIZE +
+                               L2CAP_PKT_OVERHEAD + L2CAP_CMD_OVERHEAD;
+
+    UINT16_TO_STREAM (p, p_ccb->remote_cid);
+    UINT16_TO_STREAM (p,p_ccb->local_cid);
+
+    l2c_link_check_send_pkts (p_lcb, NULL, p_buf);
+}
+
 #endif /* BLE_INCLUDED == TRUE */
 
+#if (C2H_FLOW_CONTROL_INCLUDED == TRUE)
+/*******************************************************************************
+**
+** Function         l2cu_find_completed_packets
+**
+** Description      Find the completed packets,
+**                  Then set it to zero
+**
+** Returns          The num of handles
+**
+*******************************************************************************/
+UINT8 l2cu_find_completed_packets(UINT16 *handles, UINT16 *num_packets)
+{
+    int         xx;
+    UINT8       num = 0;
+    tL2C_LCB    *p_lcb = &l2cb.lcb_pool[0];
+
+    for (xx = 0; xx < MAX_L2CAP_LINKS; xx++, p_lcb++) {
+        if ((p_lcb->in_use) && (p_lcb->completed_packets > 0)) {
+            *(handles++) = p_lcb->handle;
+            *(num_packets++) = p_lcb->completed_packets;
+            num++;
+            p_lcb->completed_packets = 0;
+        }
+    }
+
+    return num;
+}
+#endif ///C2H_FLOW_CONTROL_INCLUDED == TRUE
 
 /*******************************************************************************
 ** Functions used by both Full and Light Stack
@@ -3131,7 +3465,7 @@ BT_HDR *l2cu_get_next_buffer_to_send (tL2C_LCB *p_lcb)
                 return (p_buf);
             }
 #else
-            continue;          
+            continue;
 #endif  ///CLASSIC_BT_INCLUDED == TRUE
 
         } else {

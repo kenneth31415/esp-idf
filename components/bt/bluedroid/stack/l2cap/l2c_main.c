@@ -26,15 +26,15 @@
 #include <string.h>
 //#include <stdio.h>
 
-#include "controller.h"
+#include "device/controller.h"
 //#include "btcore/include/counter.h"
-#include "bt_target.h"
+#include "common/bt_target.h"
 #include "btm_int.h"
-#include "btu.h"
-#include "hcimsgs.h"
-#include "l2c_api.h"
+#include "stack/btu.h"
+#include "stack/hcimsgs.h"
+#include "stack/l2c_api.h"
 #include "l2c_int.h"
-#include "l2cdefs.h"
+#include "stack/l2cdefs.h"
 //#include "osi/include/log.h"
 
 /********************************************************************************/
@@ -48,6 +48,8 @@ static void process_l2cap_cmd (tL2C_LCB *p_lcb, UINT8 *p, UINT16 pkt_len);
 /********************************************************************************/
 #if L2C_DYNAMIC_MEMORY == FALSE
 tL2C_CB l2cb;
+#else
+tL2C_CB *l2c_cb_ptr;
 #endif
 
 /*******************************************************************************
@@ -122,6 +124,7 @@ void l2c_rcv_acl_data (BT_HDR *p_msg)
     tL2C_LCB    *p_lcb;
     tL2C_CCB    *p_ccb = NULL;
     UINT16      l2cap_len, rcv_cid, psm;
+    UINT16      credit;
 
     /* Extract the handle */
     STREAM_TO_UINT16 (handle, p);
@@ -275,6 +278,20 @@ void l2c_rcv_acl_data (BT_HDR *p_msg)
         if (p_ccb == NULL) {
             osi_free (p_msg);
         } else {
+            if (p_lcb->transport == BT_TRANSPORT_LE) {
+                // Got a pkt, valid send out credits to the peer device
+                credit = L2CAP_LE_DEFAULT_CREDIT;
+                L2CAP_TRACE_DEBUG("%s Credits received %d",__func__, credit);
+                if((p_ccb->peer_conn_cfg.credits + credit) > L2CAP_LE_MAX_CREDIT) {
+                    /* we have received credits more than max coc credits,
+                     * so disconnecting the Le Coc Channel
+                     */
+                    l2cble_send_peer_disc_req (p_ccb);
+                } else {
+                    p_ccb->peer_conn_cfg.credits += credit;
+                    l2c_link_check_send_pkts (p_ccb->p_lcb, NULL, NULL);
+                }
+            }
             /* Basic mode packets go straight to the state machine */
             if (p_ccb->peer_cfg.fcr.mode == L2CAP_FCR_BASIC_MODE) {
 #if (CLASSIC_BT_INCLUDED == TRUE)
@@ -800,7 +817,9 @@ void l2c_process_held_packets(BOOLEAN timed_out)
 void l2c_init (void)
 {
     INT16  xx;
-
+#if L2C_DYNAMIC_MEMORY
+    l2c_cb_ptr = (tL2C_CB *)osi_malloc(sizeof(tL2C_CB));
+#endif /* #if L2C_DYNAMIC_MEMORY */
     memset (&l2cb, 0, sizeof (tL2C_CB));
     /* the psm is increased by 2 before being used */
     l2cb.dyn_psm = 0xFFF;
@@ -851,7 +870,7 @@ void l2c_init (void)
 
     l2cb.rcv_pending_q = list_new(NULL);
     if (l2cb.rcv_pending_q == NULL) {
-        LOG_ERROR("%s unable to allocate memory for link layer control block", __func__);
+        L2CAP_TRACE_ERROR("%s unable to allocate memory for link layer control block", __func__);
     }
 }
 
@@ -859,6 +878,9 @@ void l2c_free(void)
 {
     list_free(l2cb.rcv_pending_q);
     l2cb.rcv_pending_q = NULL;
+#if L2C_DYNAMIC_MEMORY
+    FREE_AND_RESET(l2c_cb_ptr);
+#endif 
 }
 
 /*******************************************************************************
@@ -896,7 +918,12 @@ void l2c_process_timeout (TIMER_LIST_ENT *p_tle)
         break;
     case BTU_TTYPE_L2CAP_UPDA_CONN_PARAMS: {
         UINT8 status = HCI_ERR_HOST_TIMEOUT;
-        l2c_send_update_conn_params_cb((tL2C_LCB *)p_tle->param, status);
+        tL2C_LCB *p_lcb = (tL2C_LCB *)p_tle->param;
+        if (p_lcb){
+            p_lcb->conn_update_mask &= ~L2C_BLE_UPDATE_PENDING;
+            p_lcb->conn_update_mask &= ~L2C_BLE_UPDATE_PARAM_FULL;
+        }
+        l2c_send_update_conn_params_cb(p_lcb, status);
         break;
     }
     }
@@ -939,7 +966,7 @@ UINT8 l2c_data_write (UINT16 cid, BT_HDR *p_data, UINT16 flags)
 
     /* If already congested, do not accept any more packets */
     if (p_ccb->cong_sent) {
-        L2CAP_TRACE_ERROR ("L2CAP - CID: 0x%04x cannot send, already congested  xmit_hold_q.count: %u  buff_quota: %u",
+        L2CAP_TRACE_DEBUG ("L2CAP - CID: 0x%04x cannot send, already congested  xmit_hold_q.count: %u  buff_quota: %u",
                            p_ccb->local_cid,
                            fixed_queue_length(p_ccb->xmit_hold_q),
                            p_ccb->buff_quota);

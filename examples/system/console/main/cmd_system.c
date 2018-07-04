@@ -13,17 +13,26 @@
 #include "esp_log.h"
 #include "esp_console.h"
 #include "esp_system.h"
+#include "esp_sleep.h"
 #include "driver/rtc_io.h"
 #include "argtable3/argtable3.h"
 #include "cmd_decl.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "soc/rtc_cntl_reg.h"
+#include "sdkconfig.h"
+
+#ifdef CONFIG_FREERTOS_USE_STATS_FORMATTING_FUNCTIONS
+#define WITH_TASKS_INFO 1
+#endif
 
 static void register_free();
 static void register_restart();
 static void register_deep_sleep();
 static void register_make();
+#if WITH_TASKS_INFO
+static void register_tasks();
+#endif
 
 void register_system()
 {
@@ -31,6 +40,9 @@ void register_system()
     register_restart();
     register_deep_sleep();
     register_make();
+#if WITH_TASKS_INFO
+    register_tasks();
+#endif
 }
 
 /** 'restart' command restarts the program */
@@ -71,6 +83,37 @@ static void register_free()
     ESP_ERROR_CHECK( esp_console_cmd_register(&cmd) );
 }
 
+/** 'tasks' command prints the list of tasks and related information */
+#if WITH_TASKS_INFO
+
+static int tasks_info(int argc, char** argv)
+{
+    const size_t bytes_per_task = 40; /* see vTaskList description */
+    char* task_list_buffer = malloc(uxTaskGetNumberOfTasks() * bytes_per_task);
+    if (task_list_buffer == NULL) {
+        ESP_LOGE(__func__, "failed to allocate buffer for vTaskList output");
+        return 1;
+    }
+    fputs("Task Name\tStatus\tPrio\tHWM\tTask Number\n", stdout);    
+    vTaskList(task_list_buffer);
+    fputs(task_list_buffer, stdout);
+    free(task_list_buffer);
+    return 0;
+}
+
+static void register_tasks()
+{
+    const esp_console_cmd_t cmd = {
+        .command = "tasks",
+        .help = "Get information about running tasks",
+        .hint = NULL,
+        .func = &tasks_info,
+    };
+    ESP_ERROR_CHECK( esp_console_cmd_register(&cmd) );
+}
+
+#endif // WITH_TASKS_INFO
+
 /** 'deep_sleep' command puts the chip into deep sleep mode */
 
 static struct {
@@ -91,7 +134,7 @@ static int deep_sleep(int argc, char** argv)
     if (deep_sleep_args.wakeup_time->count) {
         uint64_t timeout = 1000ULL * deep_sleep_args.wakeup_time->ival[0];
         ESP_LOGI(__func__, "Enabling timer wakeup, timeout=%lluus", timeout);
-        ESP_ERROR_CHECK( esp_deep_sleep_enable_timer_wakeup(timeout) );
+        ESP_ERROR_CHECK( esp_sleep_enable_timer_wakeup(timeout) );
     }
     if (deep_sleep_args.wakeup_gpio_num->count) {
         int io_num = deep_sleep_args.wakeup_gpio_num->ival[0];
@@ -110,8 +153,9 @@ static int deep_sleep(int argc, char** argv)
         ESP_LOGI(__func__, "Enabling wakeup on GPIO%d, wakeup on %s level",
                 io_num, level ? "HIGH" : "LOW");
 
-        ESP_ERROR_CHECK( esp_deep_sleep_enable_ext1_wakeup(1ULL << io_num, level) );
+        ESP_ERROR_CHECK( esp_sleep_enable_ext1_wakeup(1ULL << io_num, level) );
     }
+    rtc_gpio_isolate(GPIO_NUM_12);
     esp_deep_sleep_start();
 }
 

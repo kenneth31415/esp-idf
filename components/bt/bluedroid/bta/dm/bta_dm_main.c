@@ -22,9 +22,11 @@
  *
  ******************************************************************************/
 
-#include "bta_api.h"
-#include "bta_sys.h"
+#include "bta/bta_api.h"
+#include "bta/bta_sys.h"
 #include "bta_dm_int.h"
+#include "osi/allocator.h"
+#include <string.h>
 
 
 /*****************************************************************************
@@ -35,6 +37,10 @@
 tBTA_DM_CB  bta_dm_cb;
 tBTA_DM_SEARCH_CB bta_dm_search_cb;
 tBTA_DM_DI_CB       bta_dm_di_cb;
+#else
+tBTA_DM_CB  *bta_dm_cb_ptr;
+tBTA_DM_SEARCH_CB *bta_dm_search_cb_ptr;
+tBTA_DM_DI_CB       *bta_dm_di_cb_ptr;
 #endif
 
 
@@ -53,18 +59,18 @@ const tBTA_DM_ACTION bta_dm_action[BTA_DM_MAX_EVT] = {
     bta_dm_set_visibility,                  /* 3  BTA_DM_API_SET_VISIBILITY_EVT */
     bta_dm_acl_change,                      /* 8  BTA_DM_ACL_CHANGE_EVT */
     bta_dm_add_device,                      /* 9  BTA_DM_API_ADD_DEVICE_EVT */
-    bta_dm_close_acl,                       /* 10  BTA_DM_API_ADD_DEVICE_EVT */
+    bta_dm_close_acl,                       /* 10  BTA_DM_API_REMOVE_ACL_EVT */
 #if (SMP_INCLUDED == TRUE)
     /* security API events */
     bta_dm_bond,                            /* 11  BTA_DM_API_BOND_EVT */
     bta_dm_bond_cancel,                     /* 12  BTA_DM_API_BOND_CANCEL_EVT */
     bta_dm_pin_reply,                       /* 13 BTA_DM_API_PIN_REPLY_EVT */
 #endif  ///SMP_INCLUDED == TRUE
-#if (BTM_SSR_INCLUDED == TRUE)
+#if (BTA_DM_PM_INCLUDED == TRUE)
     /* power manger events */
     bta_dm_pm_btm_status,                   /* 16 BTA_DM_PM_BTM_STATUS_EVT */
     bta_dm_pm_timer,                        /* 17 BTA_DM_PM_TIMER_EVT*/
-#endif  ///BTM_SSR_INCLUDED == TRUE
+#endif /* #if (BTA_DM_PM_INCLUDED == TRUE) */
     /* simple pairing events */
 #if (SMP_INCLUDED == TRUE)
     bta_dm_confirm,                         /* 18 BTA_DM_API_CONFIRM_EVT */
@@ -91,6 +97,7 @@ const tBTA_DM_ACTION bta_dm_action[BTA_DM_MAX_EVT] = {
     bta_dm_ble_set_scan_params,             /* BTA_DM_API_BLE_SCAN_PARAM_EVT */
     bta_dm_ble_set_scan_fil_params,         /* BTA_DM_API_BLE_SCAN_FIL_PARAM_EVT */
     bta_dm_ble_observe,                     /* BTA_DM_API_BLE_OBSERVE_EVT*/
+    bta_dm_ble_scan,                        /* BTA_DM_API_BLE_SCAN_EVT */
     bta_dm_ble_update_conn_params,          /* BTA_DM_API_UPDATE_CONN_PARAM_EVT */
     /* This handler function added by
        Yulong at 2016/9/9 to support the
@@ -104,6 +111,7 @@ const tBTA_DM_ACTION bta_dm_action[BTA_DM_MAX_EVT] = {
 #if BLE_PRIVACY_SPT == TRUE
     bta_dm_ble_config_local_privacy,        /* BTA_DM_API_LOCAL_PRIVACY_EVT */
 #endif
+    bta_dm_ble_config_local_icon,           /* BTA_DM_API_LOCAL_ICON_EVT */
     bta_dm_ble_set_adv_params,              /* BTA_DM_API_BLE_ADV_PARAM_EVT */
     bta_dm_ble_set_adv_params_all,          /* BTA_DM_API_BLE_ADV_PARAM_All_EVT */
     bta_dm_ble_set_adv_config,              /* BTA_DM_API_BLE_SET_ADV_CONFIG_EVT */
@@ -140,6 +148,9 @@ const tBTA_DM_ACTION bta_dm_action[BTA_DM_MAX_EVT] = {
 
     bta_dm_remove_all_acl,                  /* BTA_DM_API_REMOVE_ALL_ACL_EVT */
     bta_dm_remove_device,                   /* BTA_DM_API_REMOVE_DEVICE_EVT */
+    bta_dm_update_white_list,               /* BTA_DM_API_UPDATE_WHITE_LIST_EVT */
+    bta_dm_ble_read_adv_tx_power,           /* BTA_DM_API_BLE_READ_ADV_TX_POWER_EVT */
+    bta_dm_ble_read_rssi,                   /* BTA_DM_API_BLE_READ_RSSI_EVT */
 };
 
 
@@ -340,6 +351,18 @@ const tBTA_DM_ST_TBL bta_dm_search_st_tbl[] = {
 void bta_dm_sm_disable( )
 {
     bta_sys_deregister( BTA_ID_DM );
+}
+
+void bta_dm_sm_deinit(void)
+{
+    memset(&bta_dm_cb, 0, sizeof(tBTA_DM_CB));
+    memset(&bta_dm_search_cb, 0, sizeof(tBTA_DM_SEARCH_CB));
+    memset(&bta_dm_di_cb, 0, sizeof(tBTA_DM_DI_CB));
+#if BTA_DYNAMIC_MEMORY
+    FREE_AND_RESET(bta_dm_cb_ptr);
+    FREE_AND_RESET(bta_dm_search_cb_ptr);
+    FREE_AND_RESET(bta_dm_di_cb_ptr);
+#endif /* #if BTA_DYNAMIC_MEMORY */
 }
 
 

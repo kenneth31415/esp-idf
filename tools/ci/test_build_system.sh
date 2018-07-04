@@ -3,11 +3,12 @@
 # Test the build system for basic consistency
 #
 # A bash script that tests some likely make failure scenarios in a row
-# Creates its own test build directory under TMP and cleans it up when done.
+#
+# Assumes PWD is an out-of-tree build directory, and will create a
+# subdirectory inside it to run build tests in.
 #
 # Environment variables:
 # IDF_PATH - must be set
-# TMP - can override /tmp location for build directory
 # ESP_IDF_TEMPLATE_GIT - Can override git clone source for template app. Otherwise github.
 # NOCLEANUP - Set to '1' if you want the script to leave its temporary directory when done, for post-mortem.
 #
@@ -26,7 +27,6 @@
 
 # Set up some variables
 #
-[ -z ${TMP} ] && TMP="/tmp"
 # override ESP_IDF_TEMPLATE_GIT to point to a local dir if you're testing and want fast iterations
 [ -z ${ESP_IDF_TEMPLATE_GIT} ] && ESP_IDF_TEMPLATE_GIT=https://github.com/espressif/esp-idf-template.git
 
@@ -134,13 +134,13 @@ function run_tests()
 
     print_status "Can still clean build if all text files are CRLFs"
     make clean || failure "Unexpected failure to make clean"
-    find . -exec unix2dos {} \; # CRLFify template dir
+    find . -path .git -prune -exec unix2dos {} \; # CRLFify template dir
     # make a copy of esp-idf and CRLFify it
     CRLF_ESPIDF=${TESTDIR}/esp-idf-crlf
     mkdir -p ${CRLF_ESPIDF}
     cp -r ${IDF_PATH}/* ${CRLF_ESPIDF}
     # don't CRLFify executable files, as Linux will fail to execute them
-    find ${CRLF_ESPIDF} -type f ! -perm 755 -exec unix2dos {} \;
+    find ${CRLF_ESPIDF} -name .git -prune -name build -prune -type f ! -perm 755 -exec unix2dos {} \;
     make IDF_PATH=${CRLF_ESPIDF} || failure "Failed to build with CRLFs in source"
     # do the same checks we do for the clean build
     assert_built ${APP_BINS} ${BOOTLOADER_BINS} partitions_singleapp.bin
@@ -165,6 +165,8 @@ function run_tests()
     take_build_snapshot
     touch sdkconfig
     make
+    # check the component_project_vars.mk file was rebuilt
+    assert_rebuilt esp32/component_project_vars.mk
     # pick one each of .c, .cpp, .S that #includes sdkconfig.h
     # and therefore should rebuild
     assert_rebuilt newlib/syscall_table.o
@@ -180,6 +182,57 @@ function run_tests()
     assert_rebuilt newlib/syscall_table.o
     assert_rebuilt nvs_flash/src/nvs_api.o
     assert_rebuilt freertos/xtensa_vectors.o
+
+    print_status "print_flash_cmd target should produce one line of output"
+    make
+    test $(make print_flash_cmd V=0 | wc -l | tr -d ' ') -eq 1
+
+    print_status "Can include/exclude object files"
+    echo "#error This file should not compile" > main/excluded_file.c
+    echo "int required_global;" > main/included_file.c
+    echo "COMPONENT_OBJEXCLUDE := excluded_file.o" >> main/component.mk
+    echo "COMPONENT_OBJINCLUDE := included_file.o" >> main/component.mk
+    echo "COMPONENT_ADD_LDFLAGS := -l\$(COMPONENT_NAME) -u required_global" >> main/component.mk
+    make
+    git checkout main/component.mk
+    rm main/{included,excluded}_file.c
+
+    print_status "Can include/exclude object files outside of component tree"
+    mkdir -p extra_source_dir
+    echo "#error This file should not compile" > extra_source_dir/excluded_file.c
+    echo "int required_global;" > extra_source_dir/included_file.c
+    echo "COMPONENT_SRCDIRS := . ../extra_source_dir" >> main/component.mk
+    echo "COMPONENT_OBJEXCLUDE := ../extra_source_dir/excluded_file.o" >> main/component.mk
+    echo "COMPONENT_OBJINCLUDE := ../extra_source_dir/included_file.o" >> main/component.mk
+    echo "COMPONENT_ADD_LDFLAGS := -l\$(COMPONENT_NAME) -u required_global" >> main/component.mk
+    make
+    git checkout main/component.mk
+    rm -rf extra_source_dir
+
+    print_status "Can build without git installed on system"
+    clean_build_dir
+    # Make provision for getting IDF version
+    echo "custom-version-x.y" > ${IDF_PATH}/version.txt
+    # Hide .gitmodules so that submodule check is avoided
+    [ -f ${IDF_PATH}/.gitmodules ] && mv ${IDF_PATH}/.gitmodules ${IDF_PATH}/.gitmodules_backup
+    # Overload `git` command
+    echo -e '#!/bin/bash\ntouch ${IDF_PATH}/git_invoked' > git
+    chmod +x git
+    OLD_PATH=$PATH
+    export PATH="$PWD:$PATH"
+    make
+    [ -f ${IDF_PATH}/git_invoked ] && rm ${IDF_PATH}/git_invoked && failure "git should not have been invoked in this case"
+    rm -f ${IDF_PATH}/version.txt git
+    [ -f ${IDF_PATH}/.gitmodules_backup ] && mv ${IDF_PATH}/.gitmodules_backup ${IDF_PATH}/.gitmodules
+    export PATH=$OLD_PATH
+
+    print_status "Build fails if partitions don't fit in flash"
+    cp sdkconfig sdkconfig.bak
+    sed -i "s/CONFIG_ESPTOOLPY_FLASHSIZE.\+//" sdkconfig  # remove all flashsize config
+    echo "CONFIG_ESPTOOLPY_FLASHSIZE_1MB=y" >> sdkconfig     # introduce undersize flash
+    make defconfig || failure "Failed to reconfigure with smaller flash"
+    ( make 2>&1 | grep "does not fit in configured flash size 1MB" ) || failure "Build didn't fail with expected flash size failure message"
+    mv sdkconfig.bak sdkconfig
 
     print_status "All tests completed"
     if [ -n "${FAILURES}" ]; then
@@ -205,7 +258,7 @@ function failure()
     FAILURES="${FAILURES}${STATUS} :: $1\n"
 }
 
-TESTDIR=${TMP}/build_system_tests_$$
+TESTDIR=${PWD}/build_system_tests_$$
 mkdir -p ${TESTDIR}
 # set NOCLEANUP=1 if you want to keep the test directory around
 # for post-mortem debugging

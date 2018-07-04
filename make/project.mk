@@ -10,7 +10,9 @@
 # where this file is located.
 #
 
-.PHONY: build-components menuconfig defconfig all build clean all_binaries check-submodules size size-components size-files list-components
+.PHONY: build-components menuconfig defconfig all build clean all_binaries check-submodules size size-components size-files size-symbols list-components
+
+MAKECMDGOALS ?= all
 all: all_binaries
 # see below for recipe of 'all' target
 #
@@ -30,6 +32,7 @@ help:
 	@echo "make clean - Remove all build output"
 	@echo "make size - Display the static memory footprint of the app"
 	@echo "make size-components, size-files - Finer-grained memory footprints"
+	@echo "make size-symbols - Per symbol memory footprint. Requires COMPONENT=<component>"
 	@echo "make erase_flash - Erase entire flash contents"
 	@echo "make monitor - Run idf_monitor tool to monitor serial output from app"
 	@echo "make simple_monitor - Monitor serial output on terminal console"
@@ -38,20 +41,40 @@ help:
 	@echo "make app - Build just the app"
 	@echo "make app-flash - Flash just the app"
 	@echo "make app-clean - Clean just the app"
+	@echo "make print_flash_cmd - Print the arguments for esptool when flash"
 	@echo ""
 	@echo "See also 'make bootloader', 'make bootloader-flash', 'make bootloader-clean', "
 	@echo "'make partition_table', etc, etc."
 
+# Non-interactive targets. Mostly, those for which you do not need to build a binary
+NON_INTERACTIVE_TARGET += defconfig clean% %clean help list-components print_flash_cmd
+
 # dependency checks
 ifndef MAKE_RESTARTS
 ifeq ("$(filter 4.% 3.81 3.82,$(MAKE_VERSION))","")
-$(warning "esp-idf build system only supports GNU Make versions 3.81 or newer. You may see unexpected results with other Makes.")
+$(warning esp-idf build system only supports GNU Make versions 3.81 or newer. You may see unexpected results with other Makes.)
+endif
+
+ifdef MSYSTEM
+ifneq ("$(MSYSTEM)","MINGW32")
+$(warning esp-idf build system only supports MSYS2 in "MINGW32" mode. Consult the ESP-IDF documentation for details.)
+endif
+endif  # MSYSTEM
+
+endif  # MAKE_RESTARTS
+
+# can't run 'clean' along with any non-clean targets
+ifneq ("$(filter clean% %clean,$(MAKECMDGOALS))" ,"")
+ifneq ("$(filter-out clean% %clean,$(MAKECMDGOALS))", "")
+$(error esp-idf build system doesn't support running 'clean' targets along with any others. Run 'make clean' and then run other targets separately.)
 endif
 endif
 
+OS ?=
+
 # make IDF_PATH a "real" absolute path
 # * works around the case where a shell character is embedded in the environment variable value.
-# * changes Windows-style C:/blah/ paths to MSYS/Cygwin style /c/blah
+# * changes Windows-style C:/blah/ paths to MSYS style /c/blah
 ifeq ("$(OS)","Windows_NT")
 # On Windows MSYS2, make wildcard function returns empty string for paths of form /xyz
 # where /xyz is a directory inside the MSYS root - so we don't use it.
@@ -76,7 +99,7 @@ $(error If IDF_PATH is overriden on command line, it must be an absolute path wi
 endif
 
 ifneq ("$(IDF_PATH)","$(subst :,,$(IDF_PATH))")
-$(error IDF_PATH cannot contain colons. If overriding IDF_PATH on Windows, use Cygwin-style /c/dir instead of C:/dir)
+$(error IDF_PATH cannot contain colons. If overriding IDF_PATH on Windows, use MSYS Unix-style /c/dir instead of C:/dir)
 endif
 
 # disable built-in make rules, makes debugging saner
@@ -105,6 +128,7 @@ export BUILD_DIR_BASE
 # or the directory contains subdirectories which are components.)
 # The project Makefile can override these component dirs, or add extras via EXTRA_COMPONENT_DIRS
 ifndef COMPONENT_DIRS
+EXTRA_COMPONENT_DIRS ?=
 COMPONENT_DIRS := $(PROJECT_PATH)/components $(EXTRA_COMPONENT_DIRS) $(IDF_PATH)/components $(PROJECT_PATH)/main
 endif
 export COMPONENT_DIRS
@@ -115,7 +139,7 @@ COMPONENT_DIRS += $(abspath $(SRCDIRS))
 endif
 
 # The project Makefile can define a list of components, but if it does not do this we just take all available components
-# in the component dirs. A component is COMPONENT_DIRS directory, or immediate subdirectory, 
+# in the component dirs. A component is COMPONENT_DIRS directory, or immediate subdirectory,
 # which contains a component.mk file.
 #
 # Use the "make list-components" target to debug this step.
@@ -127,6 +151,11 @@ COMPONENTS := $(dir $(foreach cd,$(COMPONENT_DIRS),                           \
 				))
 COMPONENTS := $(sort $(foreach comp,$(COMPONENTS),$(lastword $(subst /, ,$(comp)))))
 endif
+# After a full manifest of component names is determined, subtract the ones explicitly omitted by the project Makefile.
+ifdef EXCLUDE_COMPONENTS
+COMPONENTS := $(filter-out $(subst ",,$(EXCLUDE_COMPONENTS)), $(COMPONENTS)) 
+# to keep syntax highlighters happy: "))
+endif
 export COMPONENTS
 
 # Resolve all of COMPONENTS into absolute paths in COMPONENT_PATHS.
@@ -136,17 +165,21 @@ export COMPONENTS
 # NOTE: These paths must be generated WITHOUT a trailing / so we
 # can use $(notdir x) to get the component name.
 COMPONENT_PATHS := $(foreach comp,$(COMPONENTS),$(firstword $(foreach cd,$(COMPONENT_DIRS),$(wildcard $(dir $(cd))$(comp) $(cd)/$(comp)))))
+export COMPONENT_PATHS
 
-# If TESTS_ALL set to 1, set TEST_COMPONENTS_LIST to all components
+TEST_COMPONENTS ?=
+TESTS_ALL ?=
+
+# If TESTS_ALL set to 1, set TEST_COMPONENTS_LIST to all components.
+# Otherwise, use the list supplied in TEST_COMPONENTS.
 ifeq ($(TESTS_ALL),1)
 TEST_COMPONENTS_LIST := $(COMPONENTS)
 else
-# otherwise, use TEST_COMPONENTS
 TEST_COMPONENTS_LIST := $(TEST_COMPONENTS)
 endif
-TEST_COMPONENT_PATHS := $(foreach comp,$(TEST_COMPONENTS_LIST),$(firstword $(foreach dir,$(COMPONENT_DIRS),$(wildcard $(dir)/$(comp)/test))))
-TEST_COMPONENT_NAMES :=  $(foreach comp,$(TEST_COMPONENT_PATHS),$(lastword $(subst /, ,$(dir $(comp))))_test)
 
+TEST_COMPONENT_PATHS := $(foreach comp,$(TEST_COMPONENTS_LIST),$(firstword $(foreach dir,$(COMPONENT_DIRS),$(wildcard $(dir)/$(comp)/test))))
+TEST_COMPONENT_NAMES := $(foreach comp,$(TEST_COMPONENT_PATHS),$(lastword $(subst /, ,$(dir $(comp))))_test)
 
 # Initialise project-wide variables which can be added to by
 # each component.
@@ -158,6 +191,7 @@ TEST_COMPONENT_NAMES :=  $(foreach comp,$(TEST_COMPONENT_PATHS),$(lastword $(sub
 COMPONENT_INCLUDES :=
 COMPONENT_LDFLAGS :=
 COMPONENT_SUBMODULES :=
+COMPONENT_LIBRARIES :=
 
 # COMPONENT_PROJECT_VARS is the list of component_project_vars.mk generated makefiles
 # for each component.
@@ -195,9 +229,15 @@ endif
 	@echo $(ESPTOOLPY_WRITE_FLASH) $(ESPTOOL_ALL_FLASH_ARGS)
 
 
+# If we have `version.txt` then prefer that for extracting IDF version
+ifeq ("$(wildcard ${IDF_PATH}/version.txt)","")
 IDF_VER := $(shell cd ${IDF_PATH} && git describe --always --tags --dirty)
+else
+IDF_VER := `cat ${IDF_PATH}/version.txt`
+endif
 
 # Set default LDFLAGS
+EXTRA_LDFLAGS ?=
 LDFLAGS ?= -nostdlib \
 	-u call_user_start_cpu0	\
 	$(EXTRA_LDFLAGS) \
@@ -207,6 +247,7 @@ LDFLAGS ?= -nostdlib \
 	$(COMPONENT_LDFLAGS) \
 	-lgcc \
 	-lstdc++ \
+	-lgcov \
 	-Wl,--end-group \
 	-Wl,-EL
 
@@ -220,6 +261,8 @@ LDFLAGS ?= -nostdlib \
 
 # CPPFLAGS used by C preprocessor
 # If any flags are defined in application Makefile, add them at the end. 
+CPPFLAGS ?=
+EXTRA_CPPFLAGS ?=
 CPPFLAGS := -DESP_PLATFORM -D IDF_VER=\"$(IDF_VER)\" -MMD -MP $(CPPFLAGS) $(EXTRA_CPPFLAGS)
 
 # Warnings-related flags relevant both for C and C++
@@ -231,6 +274,10 @@ COMMON_WARNING_FLAGS = -Wall -Werror=all \
 	-Wextra \
 	-Wno-unused-parameter -Wno-sign-compare
 
+ifdef CONFIG_WARN_WRITE_STRINGS
+COMMON_WARNING_FLAGS += -Wwrite-strings
+endif #CONFIG_WARN_WRITE_STRINGS
+
 # Flags which control code generation and dependency generation, both for C and C++
 COMMON_FLAGS = \
 	-ffunction-sections -fdata-sections \
@@ -238,14 +285,27 @@ COMMON_FLAGS = \
 	-mlongcalls \
 	-nostdlib
 
+ifndef IS_BOOTLOADER_BUILD
+# stack protection (only one option can be selected in menuconfig)
+ifdef CONFIG_STACK_CHECK_NORM
+COMMON_FLAGS += -fstack-protector
+endif
+ifdef CONFIG_STACK_CHECK_STRONG
+COMMON_FLAGS += -fstack-protector-strong
+endif
+ifdef CONFIG_STACK_CHECK_ALL
+COMMON_FLAGS += -fstack-protector-all
+endif
+endif
+
 # Optimization flags are set based on menuconfig choice
-ifneq ("$(CONFIG_OPTIMIZATION_LEVEL_RELEASE)","")
+ifdef CONFIG_OPTIMIZATION_LEVEL_RELEASE
 OPTIMIZATION_FLAGS = -Os
 else
 OPTIMIZATION_FLAGS = -Og
 endif
 
-ifeq ("$(CONFIG_OPTIMIZATION_ASSERTIONS_DISABLED)", "y")
+ifdef CONFIG_OPTIMIZATION_ASSERTIONS_DISABLED
 CPPFLAGS += -DNDEBUG
 endif
 
@@ -255,6 +315,8 @@ DEBUG_FLAGS ?= -ggdb
 
 # List of flags to pass to C compiler
 # If any flags are defined in application Makefile, add them at the end.
+CFLAGS ?=
+EXTRA_CFLAGS ?=
 CFLAGS := $(strip \
 	-std=gnu99 \
 	$(OPTIMIZATION_FLAGS) $(DEBUG_FLAGS) \
@@ -265,9 +327,10 @@ CFLAGS := $(strip \
 
 # List of flags to pass to C++ compiler
 # If any flags are defined in application Makefile, add them at the end.
+CXXFLAGS ?=
+EXTRA_CXXFLAGS ?=
 CXXFLAGS := $(strip \
 	-std=gnu++11 \
-	-fno-exceptions \
 	-fno-rtti \
 	$(OPTIMIZATION_FLAGS) $(DEBUG_FLAGS) \
 	$(COMMON_FLAGS) \
@@ -275,7 +338,20 @@ CXXFLAGS := $(strip \
 	$(CXXFLAGS) \
 	$(EXTRA_CXXFLAGS))
 
+ifdef CONFIG_CXX_EXCEPTIONS
+CXXFLAGS += -fexceptions
+else
+CXXFLAGS += -fno-exceptions
+endif
+
 export CFLAGS CPPFLAGS CXXFLAGS
+
+# Set default values that were not previously defined
+CC ?= gcc
+LD ?= ld
+AR ?= ar
+OBJCOPY ?= objcopy
+SIZE ?= size
 
 # Set host compiler and binutils
 HOSTCC := $(CC)
@@ -305,7 +381,7 @@ APP_BIN:=$(APP_ELF:.elf=.bin)
 # Include any Makefile.projbuild file letting components add
 # configuration at the project level
 define includeProjBuildMakefile
-$(if $(V),$(info including $(1)/Makefile.projbuild...))
+$(if $(V),$$(info including $(1)/Makefile.projbuild...))
 COMPONENT_PATH := $(1)
 include $(1)/Makefile.projbuild
 endef
@@ -325,19 +401,20 @@ endif
 #
 # also depends on additional dependencies (linker scripts & binary libraries)
 # stored in COMPONENT_LINKER_DEPS, built via component.mk files' COMPONENT_ADD_LINKER_DEPS variable
+COMPONENT_LINKER_DEPS ?=
 $(APP_ELF): $(foreach libcomp,$(COMPONENT_LIBRARIES),$(BUILD_DIR_BASE)/$(libcomp)/lib$(libcomp).a) $(COMPONENT_LINKER_DEPS) $(COMPONENT_PROJECT_VARS)
 	$(summary) LD $(patsubst $(PWD)/%,%,$@)
 	$(CC) $(LDFLAGS) -o $@ -Wl,-Map=$(APP_MAP)
 
-app: $(APP_BIN)
+app: $(APP_BIN) partition_table_get_info
 ifeq ("$(CONFIG_SECURE_BOOT_ENABLED)$(CONFIG_SECURE_BOOT_BUILD_SIGNED_BINARIES)","y") # secure boot enabled, but remote sign app image
 	@echo "App built but not signed. Signing step via espsecure.py:"
 	@echo "espsecure.py sign_data --keyfile KEYFILE $(APP_BIN)"
 	@echo "Then flash app command is:"
-	@echo $(ESPTOOLPY_WRITE_FLASH) $(CONFIG_APP_OFFSET) $(APP_BIN)
+	@echo $(ESPTOOLPY_WRITE_FLASH) $(APP_OFFSET) $(APP_BIN)
 else
 	@echo "App built. Default flash app command is:"
-	@echo $(ESPTOOLPY_WRITE_FLASH) $(CONFIG_APP_OFFSET) $(APP_BIN)
+	@echo $(ESPTOOLPY_WRITE_FLASH) $(APP_OFFSET) $(APP_BIN)
 endif
 
 all_binaries: $(APP_BIN)
@@ -361,10 +438,10 @@ endef
 define GenerateComponentTargets
 .PHONY: component-$(2)-build component-$(2)-clean
 
-component-$(2)-build: check-submodules
+component-$(2)-build: check-submodules $(call prereq_if_explicit, component-$(2)-clean) | $(BUILD_DIR_BASE)/$(2)
 	$(call ComponentMake,$(1),$(2)) build
 
-component-$(2)-clean:
+component-$(2)-clean: | $(BUILD_DIR_BASE)/$(2) $(BUILD_DIR_BASE)/$(2)/component_project_vars.mk
 	$(call ComponentMake,$(1),$(2)) clean
 
 $(BUILD_DIR_BASE)/$(2):
@@ -404,16 +481,26 @@ size-files: $(APP_ELF)
 size-components: $(APP_ELF)
 	$(PYTHON) $(IDF_PATH)/tools/idf_size.py --archives $(APP_MAP)
 
-# NB: this ordering is deliberate (app-clean before config-clean),
-# so config remains valid during all component clean targets
-config-clean: app-clean
-clean: config-clean
+size-symbols: $(APP_ELF)
+ifndef COMPONENT
+	$(error "ERROR: Please enter the component to look symbols for, e.g. COMPONENT=heap")
+else
+	$(PYTHON) $(IDF_PATH)/tools/idf_size.py --archive_details lib$(COMPONENT).a $(APP_MAP)
+endif
+
+# NB: this ordering is deliberate (app-clean & bootloader-clean before
+# _config-clean), so config remains valid during all component clean
+# targets
+config-clean: app-clean bootloader-clean
+clean: app-clean bootloader-clean config-clean
 
 # phony target to check if any git submodule listed in COMPONENT_SUBMODULES are missing
 # or out of date, and exit if so. Components can add paths to this variable.
 #
 # This only works for components inside IDF_PATH
 check-submodules:
+# Check if .gitmodules exists, otherwise skip submodule check, assuming flattened structure
+ifneq ("$(wildcard ${IDF_PATH}/.gitmodules)","")
 
 # Dump the git status for the whole working copy once, then grep it for each submodule. This saves a lot of time on Windows.
 GIT_STATUS := $(shell cd ${IDF_PATH} && git status --porcelain --ignore-submodules=dirty)
@@ -425,7 +512,7 @@ check-submodules: $(IDF_PATH)/$(1)/.git
 $(IDF_PATH)/$(1)/.git:
 	@echo "WARNING: Missing submodule $(1)..."
 	[ -e ${IDF_PATH}/.git ] || ( echo "ERROR: esp-idf must be cloned from git to work."; exit 1)
-	[ -x $(which git) ] || ( echo "ERROR: Need to run 'git submodule init $(1)' in esp-idf root directory."; exit 1)
+	[ -x "$(shell which git)" ] || ( echo "ERROR: Need to run 'git submodule init $(1)' in esp-idf root directory."; exit 1)
 	@echo "Attempting 'git submodule update --init $(1)' in esp-idf root directory..."
 	cd ${IDF_PATH} && git submodule update --init $(1)
 
@@ -438,6 +525,7 @@ endef
 # filter/subst in expression ensures all submodule paths begin with $(IDF_PATH), and then strips that prefix
 # so the argument is suitable for use with 'git submodule' commands
 $(foreach submodule,$(subst $(IDF_PATH)/,,$(filter $(IDF_PATH)/%,$(COMPONENT_SUBMODULES))),$(eval $(call GenerateSubmoduleCheckTarget,$(submodule))))
+endif # End check for .gitmodules existence
 
 
 # PHONY target to list components in the build and their paths
@@ -449,8 +537,15 @@ list-components:
 	$(info COMPONENTS (list of component names))
 	$(info $(COMPONENTS))
 	$(info $(call dequote,$(SEPARATOR)))
+	$(info EXCLUDE_COMPONENTS (list of excluded names))
+	$(info $(if $(EXCLUDE_COMPONENTS),$(EXCLUDE_COMPONENTS),(none provided)))	
+	$(info $(call dequote,$(SEPARATOR)))
 	$(info COMPONENT_PATHS (paths to all components):)
 	$(foreach cp,$(COMPONENT_PATHS),$(info $(cp)))
+
+# print flash command, so users can dump this to config files and download somewhere without idf
+print_flash_cmd: partition_table_get_info
+	echo $(ESPTOOL_WRITE_FLASH_OPTIONS) $(ESPTOOL_ALL_FLASH_ARGS) | sed -e 's:'$(PWD)/build/'::g'
 
 # Check toolchain version using the output of xtensa-esp32-elf-gcc --version command.
 # The output normally looks as follows
@@ -459,11 +554,11 @@ list-components:
 # the part after the brackets is extracted into TOOLCHAIN_GCC_VER.
 ifdef CONFIG_TOOLPREFIX
 ifndef MAKE_RESTARTS
-TOOLCHAIN_COMMIT_DESC := $(shell $(CC) --version | sed -E -n 's|xtensa-esp32-elf-gcc.*\ \(([^)]*).*|\1|gp')
+TOOLCHAIN_COMMIT_DESC := $(shell $(CC) --version | sed -E -n 's|.*crosstool-ng-([0-9]+).([0-9]+).([0-9]+)-([0-9]+)-g([0-9a-f]{7}).*|\1.\2.\3-\4-g\5|gp')
 TOOLCHAIN_GCC_VER := $(shell $(CC) --version | sed -E -n 's|xtensa-esp32-elf-gcc.*\ \(.*\)\ (.*)|\1|gp')
 
 # Officially supported version(s)
-SUPPORTED_TOOLCHAIN_COMMIT_DESC := crosstool-NG crosstool-ng-1.22.0-61-gab8375a
+SUPPORTED_TOOLCHAIN_COMMIT_DESC := 1.22.0-80-g6c4433a
 SUPPORTED_TOOLCHAIN_GCC_VERSIONS := 5.2.0
 
 ifdef TOOLCHAIN_COMMIT_DESC

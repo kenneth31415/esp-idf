@@ -16,7 +16,6 @@
 #include <xtensa/coreasm.h>
 #include <xtensa/corebits.h>
 #include <xtensa/config/system.h>
-#include <xtensa/simcall.h>
 #include "freertos/xtensa_context.h"
 #include "esp_panic.h"
 #include "sdkconfig.h"
@@ -45,10 +44,12 @@ _l4_intr_stack:
     .align      4
 xt_highint4:
 
+#ifndef CONFIG_FREERTOS_UNICORE
     /* See if we're here for the dport access interrupt */
     rsr     a0, INTERRUPT
     extui   a0, a0, ETS_DPORT_INUM, 1
     bnez    a0, .handle_dport_access_int
+#endif // CONFIG_FREERTOS_UNICORE
 
     /* Allocate exception frame and save minimal context. */
     mov     a0, sp
@@ -129,6 +130,7 @@ xt_highint4:
 
 
 
+#ifndef CONFIG_FREERTOS_UNICORE
 
     .align      4
 .handle_dport_access_int:
@@ -187,6 +189,7 @@ xt_highint4:
     rsr     a0, EXCSAVE_4                   /* restore a0 */
     rfi     4
 
+#endif // CONFIG_FREERTOS_UNICORE
 
 /* The linker has no reason to link in this file; all symbols it exports are already defined
    (weakly!) in the default int handler. Define a symbol here so we can use it to have the 

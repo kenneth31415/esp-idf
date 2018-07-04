@@ -16,6 +16,10 @@
 
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef struct {
     uint32_t reserved1: 1;
     uint32_t disable_int_on_completion: 1;
@@ -251,7 +255,7 @@ typedef volatile struct {
 
     union {
         struct {
-            uint32_t cards: 2;              ///< bit N reads 1 if card N is present
+            uint32_t cards: 2;              ///< bit N reads 0 if card N is present
             uint32_t reserved: 30;
         };
         uint32_t val;
@@ -259,7 +263,7 @@ typedef volatile struct {
 
     union {
         struct {
-            uint32_t card0: 2;              ///< bit N reads 1 if card N is write protected
+            uint32_t cards: 2;              ///< bit N reads 1 if card N is write protected
             uint32_t reserved: 30;
         };
         uint32_t val;
@@ -366,6 +370,8 @@ extern sdmmc_dev_t SDMMC;
 
 _Static_assert(sizeof(sdmmc_dev_t) == 0x804, "invalid size of sdmmc_dev_t structure");
 
-
+#ifdef __cplusplus
+}
+#endif
 
 #endif //_SOC_SDMMC_STRUCT_H_

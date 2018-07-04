@@ -15,15 +15,19 @@ SDKCONFIG ?= $(PROJECT_PATH)/sdkconfig
 # overrides (usually used for esp-idf examples)
 SDKCONFIG_DEFAULTS ?= $(PROJECT_PATH)/sdkconfig.defaults
 
+# Workaround to run make parallel (-j). mconf and conf cannot be made simultaneously
+$(KCONFIG_TOOL_DIR)/mconf: $(KCONFIG_TOOL_DIR)/conf
+
 # reset MAKEFLAGS as the menuconfig makefile uses implicit compile rules
-$(KCONFIG_TOOL_DIR)/mconf $(KCONFIG_TOOL_DIR)/conf:
-	MAKEFLAGS=$(ORIGINAL_MAKEFLAGS) CC=$(HOSTCC) LD=$(HOSTLD) \
+$(KCONFIG_TOOL_DIR)/mconf $(KCONFIG_TOOL_DIR)/conf: $(wildcard $(KCONFIG_TOOL_DIR)/*.c)
+	MAKEFLAGS="" CC=$(HOSTCC) LD=$(HOSTLD) \
 	$(MAKE) -C $(KCONFIG_TOOL_DIR)
 
 ifeq ("$(wildcard $(SDKCONFIG))","")
-ifeq ("$(filter defconfig, $(MAKECMDGOALS))","")
-# if no configuration file is present and defconfig is not a named
-# target, run defconfig then menuconfig to get the initial config
+# if no configuration file is present we need a rule for it
+ifeq ("$(filter $(NON_INTERACTIVE_TARGET), $(MAKECMDGOALS))","")
+# if special non-interactive item is not a named target (eg. 'defconfig', 'clean')
+# run defconfig then menuconfig to get the initial config
 $(SDKCONFIG): menuconfig
 menuconfig: defconfig
 else
@@ -42,7 +46,7 @@ define RunConf
 	$(KCONFIG_TOOL_DIR)/$1 $(IDF_PATH)/Kconfig
 endef
 
-ifeq ("$(MAKE_RESTARTS)","")
+ifndef MAKE_RESTARTS
 # menuconfig, defconfig and "GENCONFIG" configuration generation only
 # ever run on the first make pass, subsequent passes don't run these
 # (make often wants to re-run them as the conf tool can regenerate the
@@ -92,6 +96,6 @@ endif
 
 .PHONY: config-clean defconfig menuconfig
 config-clean:
-	$(summary RM CONFIG)
-	$(MAKE) -C $(KCONFIG_TOOL_DIR) clean
+	$(summary) RM CONFIG
+	MAKEFLAGS="" $(MAKE) -C $(KCONFIG_TOOL_DIR) clean
 	rm -rf $(BUILD_DIR_BASE)/include/config $(BUILD_DIR_BASE)/include/sdkconfig.h

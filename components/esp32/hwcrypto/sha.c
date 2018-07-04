@@ -163,15 +163,17 @@ static void esp_sha_lock_engine_inner(sha_engine_state *engine)
         DPORT_REG_SET_BIT(DPORT_PERI_CLK_EN_REG, DPORT_PERI_EN_SHA);
         /* also clear reset on secure boot, otherwise SHA is held in reset */
         DPORT_REG_CLR_BIT(DPORT_PERI_RST_EN_REG,
-                    DPORT_PERI_EN_SHA
-                    | DPORT_PERI_EN_SECUREBOOT);
+                           DPORT_PERI_EN_SHA
+                           | DPORT_PERI_EN_SECUREBOOT);
+        DPORT_STALL_OTHER_CPU_START();
         ets_sha_enable();
+        DPORT_STALL_OTHER_CPU_END();
     }
-
-    _lock_release(&state_change_lock);
 
     assert( !engine->in_use && "in_use flag should be cleared" );
     engine->in_use = true;
+
+    _lock_release(&state_change_lock);
 }
 
 
@@ -198,10 +200,14 @@ void esp_sha_unlock_engine(esp_sha_type sha_type)
 
 void esp_sha_wait_idle(void)
 {
-    while(REG_READ(SHA_1_BUSY_REG) == 1) {}
-    while(REG_READ(SHA_256_BUSY_REG) == 1) {}
-    while(REG_READ(SHA_384_BUSY_REG) == 1) {}
-    while(REG_READ(SHA_512_BUSY_REG) == 1) {}
+    while(1) {
+        if(DPORT_REG_READ(SHA_1_BUSY_REG) == 0
+           && DPORT_REG_READ(SHA_256_BUSY_REG) == 0
+           && DPORT_REG_READ(SHA_384_BUSY_REG) == 0
+           && DPORT_REG_READ(SHA_512_BUSY_REG) == 0) {
+            break;
+        }
+    }
 }
 
 void esp_sha_read_digest_state(esp_sha_type sha_type, void *digest_state)
@@ -213,22 +219,21 @@ void esp_sha_read_digest_state(esp_sha_type sha_type, void *digest_state)
 
     esp_sha_wait_idle();
 
-    REG_WRITE(SHA_LOAD_REG(sha_type), 1);
-    while(REG_READ(SHA_BUSY_REG(sha_type)) == 1) { }
-
+    DPORT_REG_WRITE(SHA_LOAD_REG(sha_type), 1);
+    while(DPORT_REG_READ(SHA_BUSY_REG(sha_type)) == 1) { }
     uint32_t *digest_state_words = (uint32_t *)digest_state;
     uint32_t *reg_addr_buf = (uint32_t *)(SHA_TEXT_BASE);
     if(sha_type == SHA2_384 || sha_type == SHA2_512) {
         /* for these ciphers using 64-bit states, swap each pair of words */
+        DPORT_INTERRUPT_DISABLE(); // Disable interrupt only on current CPU.
         for(int i = 0; i < sha_length(sha_type)/4; i += 2) {
-            digest_state_words[i+1] = reg_addr_buf[i];
-            digest_state_words[i]= reg_addr_buf[i+1];
+            digest_state_words[i+1] = DPORT_SEQUENCE_REG_READ((uint32_t)&reg_addr_buf[i]);
+            digest_state_words[i]   = DPORT_SEQUENCE_REG_READ((uint32_t)&reg_addr_buf[i+1]);
         }
+        DPORT_INTERRUPT_RESTORE(); // restore the previous interrupt level
     } else {
-        memcpy(digest_state_words, reg_addr_buf, sha_length(sha_type));
+        esp_dport_access_read_buffer(digest_state_words, (uint32_t)&reg_addr_buf[0], sha_length(sha_type)/4);
     }
-    asm volatile ("memw");
-
     esp_sha_unlock_memory_block();
 }
 
@@ -250,9 +255,9 @@ void esp_sha_block(esp_sha_type sha_type, const void *data_block, bool is_first_
     asm volatile ("memw");
 
     if(is_first_block) {
-        REG_WRITE(SHA_START_REG(sha_type), 1);
+        DPORT_REG_WRITE(SHA_START_REG(sha_type), 1);
     } else {
-        REG_WRITE(SHA_CONTINUE_REG(sha_type), 1);
+        DPORT_REG_WRITE(SHA_CONTINUE_REG(sha_type), 1);
     }
 
     esp_sha_unlock_memory_block();
@@ -275,14 +280,23 @@ void esp_sha(esp_sha_type sha_type, const unsigned char *input, size_t ilen, uns
         size_t chunk_len = (ilen > block_len) ? block_len : ilen;
         esp_sha_lock_memory_block();
         esp_sha_wait_idle();
-        ets_sha_update(&ctx, sha_type, input, chunk_len * 8);
+        DPORT_STALL_OTHER_CPU_START();
+        {
+            // This SHA ROM function reads DPORT regs
+            ets_sha_update(&ctx, sha_type, input, chunk_len * 8);
+        }
+        DPORT_STALL_OTHER_CPU_END();
         esp_sha_unlock_memory_block();
         input += chunk_len;
         ilen -= chunk_len;
     }
     esp_sha_lock_memory_block();
     esp_sha_wait_idle();
-    ets_sha_finish(&ctx, sha_type, output);
+    DPORT_STALL_OTHER_CPU_START();
+    {
+        ets_sha_finish(&ctx, sha_type, output);
+    }
+    DPORT_STALL_OTHER_CPU_END();
     esp_sha_unlock_memory_block();
 
     esp_sha_unlock_engine(sha_type);

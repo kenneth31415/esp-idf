@@ -19,6 +19,7 @@ endif
 #
 # if V=1, $(summary) does nothing and $(details) will echo extra details
 # if V is unset or not 1, $(summary) echoes a summary and $(details) does nothing
+VERBOSE ?=
 V ?= $(VERBOSE)
 ifeq ("$(V)","1")
 summary := @true
@@ -29,6 +30,10 @@ details := @true
 
 # disable echoing of commands, directory names
 MAKEFLAGS += --silent
+endif  # $(V)==1
+
+ifdef CONFIG_MAKE_WARN_UNDEFINED_VARIABLES
+MAKEFLAGS += --warn-undefined-variables
 endif
 
 # General make utilities
@@ -57,7 +62,7 @@ endef
 #
 # example $(call resolvepath,$(CONFIG_PATH),$(CONFIG_DIR))
 define resolvepath
-$(foreach dir,$(1),$(if $(filter /%,$(dir)),$(dir),$(subst //,/,$(2)/$(dir))))
+$(abspath $(foreach dir,$(1),$(if $(filter /%,$(dir)),$(dir),$(subst //,/,$(2)/$(dir)))))
 endef
 
 
@@ -80,4 +85,12 @@ endef
 # Copied from http://stackoverflow.com/questions/16144115/makefile-remove-duplicate-words-without-sorting
 define uniq
 $(if $1,$(firstword $1) $(call uniq,$(filter-out $(firstword $1),$1)))
+endef
+
+# macro to strip leading ../s from a path
+# Given $(1) which is a directory, remove any leading ../s from it
+# (recursively keeps removing ../ until not found)
+# if the path contains nothing but ../.., a single . is returned (cwd)
+define stripLeadingParentDirs
+$(foreach path,$(1),$(if $(subst ..,,$(path)),$(if $(filter ../%,$(path)),$(call stripLeadingParentDirs,$(patsubst ../%,%,$(path))),$(path)),.))
 endef
